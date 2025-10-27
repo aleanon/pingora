@@ -14,10 +14,11 @@
 
 //! Connecting to HTTP servers
 
-use crate::connectors::ConnectorOptions;
+use crate::connectors::{BackendStatsView, ConnectorOptions};
 use crate::protocols::http::client::HttpSession;
 use crate::upstreams::peer::Peer;
 use pingora_error::Result;
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub mod v1;
@@ -91,6 +92,25 @@ impl Connector {
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.h2.prefer_h1(peer);
+    }
+
+    /// Get all backend connection statistics
+    ///
+    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// and the value is a [BackendStatsView] providing real-time access to the stats.
+    ///
+    /// Note: This returns stats from the H1 connector. H2 uses a different connection
+    /// model and its stats are included in the H1 transport layer.
+    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+        self.h1.get_backend_stats()
+    }
+
+    /// Get connection statistics for a specific backend
+    ///
+    /// Returns None if the backend has never been seen, otherwise returns a
+    /// [BackendStatsView] providing real-time access to the stats.
+    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
+        self.h1.get_backend_stat(key)
     }
 }
 

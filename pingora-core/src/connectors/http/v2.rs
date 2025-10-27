@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::HttpSession;
-use crate::connectors::{ConnectorOptions, TransportConnector};
+use crate::connectors::{BackendStatsView, ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
@@ -377,6 +377,25 @@ impl Connector {
             .preferred_http_version
             .get(peer)
             .is_some_and(|v| matches!(v, ALPN::H1))
+    }
+
+    /// Get all backend connection statistics
+    ///
+    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// and the value is a [BackendStatsView] providing real-time access to the stats.
+    ///
+    /// Note: This returns stats from the underlying transport layer which is shared
+    /// between H1 and H2 connections.
+    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+        self.transport.get_backend_stats()
+    }
+
+    /// Get connection statistics for a specific backend
+    ///
+    /// Returns None if the backend has never been seen, otherwise returns a
+    /// [BackendStatsView] providing real-time access to the stats.
+    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
+        self.transport.get_backend_stat(key)
     }
 }
 

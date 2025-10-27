@@ -53,7 +53,7 @@ use pingora_cache::NoCacheReason;
 use pingora_core::apps::{
     HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream,
 };
-use pingora_core::connectors::{http::Connector, ConnectorOptions};
+use pingora_core::connectors::{http::Connector, BackendStatsView, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
@@ -68,6 +68,7 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
+use std::collections::HashMap;
 
 const TASK_BUFFER_SIZE: usize = 4;
 
@@ -528,6 +529,45 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
 
     resp
 });
+
+impl<SV> HttpProxy<SV> {
+    /// Get all backend connection statistics
+    ///
+    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// and the value is a [BackendStatsView] providing real-time access to the stats.
+    ///
+    /// This allows you to monitor active and idle connections per backend from your
+    /// [ProxyHttp] implementation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // In your service struct, store a reference to HttpProxy
+    /// let stats = http_proxy.get_backend_stats();
+    /// for (backend_hash, view) in stats {
+    ///     println!("Backend {}: {} active, {} idle",
+    ///              backend_hash, view.active(), view.idle());
+    /// }
+    /// ```
+    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+        self.client_upstream.get_backend_stats()
+    }
+
+    /// Get connection statistics for a specific backend
+    ///
+    /// Returns None if the backend has never been seen, otherwise returns a
+    /// [BackendStatsView] providing real-time access to the stats.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let peer = HttpPeer::new("127.0.0.1:8080", false, "".to_string());
+    /// if let Some(view) = http_proxy.get_backend_stat(peer.reuse_hash()) {
+    ///     println!("Active: {}, Idle: {}", view.active(), view.idle());
+    /// }
+    /// ```
+    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
+        self.client_upstream.get_backend_stat(key)
+    }
+}
 
 impl<SV> HttpProxy<SV> {
     async fn process_request(

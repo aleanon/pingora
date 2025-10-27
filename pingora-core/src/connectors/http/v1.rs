@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::connectors::{ConnectorOptions, TransportConnector};
+use crate::connectors::{BackendStatsView, ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession;
 use crate::upstreams::peer::Peer;
 
 use pingora_error::Result;
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub struct Connector {
@@ -60,6 +61,22 @@ impl Connector {
             self.transport
                 .release_stream(stream, peer.reuse_hash(), idle_timeout);
         }
+    }
+
+    /// Get all backend connection statistics
+    ///
+    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// and the value is a [BackendStatsView] providing real-time access to the stats.
+    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+        self.transport.get_backend_stats()
+    }
+
+    /// Get connection statistics for a specific backend
+    ///
+    /// Returns None if the backend has never been seen, otherwise returns a
+    /// [BackendStatsView] providing real-time access to the stats.
+    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
+        self.transport.get_backend_stat(key)
     }
 }
 

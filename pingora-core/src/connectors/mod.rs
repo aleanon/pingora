@@ -17,6 +17,7 @@
 pub mod http;
 pub mod l4;
 mod offload;
+mod stats;
 
 #[cfg(feature = "any_tls")]
 mod tls;
@@ -35,6 +36,7 @@ use offload::OffloadRuntime;
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
+pub use stats::{BackendConnectionStats, BackendStatsView, ConnectionStatsTracker};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -146,6 +148,7 @@ pub struct TransportConnector {
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
     preferred_http_version: PreferredHttpVersion,
+    stats_tracker: Arc<ConnectionStatsTracker>,
 }
 
 const DEFAULT_POOL_SIZE: usize = 128;
@@ -172,6 +175,7 @@ impl TransportConnector {
             bind_to_v4,
             bind_to_v6,
             preferred_http_version: PreferredHttpVersion::new(),
+            stats_tracker: Arc::new(ConnectionStatsTracker::new()),
         }
     }
 
@@ -262,6 +266,8 @@ impl TransportConnector {
         idle_timeout: Option<std::time::Duration>,
     ) {
         if !test_reusable_stream(&mut stream) {
+            // Connection is not reusable, track it as closed
+            self.stats_tracker.on_connection_closed(key);
             return;
         }
         let id = stream.id();
@@ -270,6 +276,10 @@ impl TransportConnector {
         let stream = Arc::new(Mutex::new(stream));
         let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
         let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
+
+        // Track that this connection is now released to the pool
+        self.stats_tracker.on_connection_released(key);
+
         let pool = self.connection_pool.clone(); //clone the arc
         let rt = pingora_runtime::current_handle();
         rt.spawn(async move {
@@ -288,18 +298,65 @@ impl TransportConnector {
         &self,
         peer: &P,
     ) -> Result<(Stream, bool)> {
+        let key = peer.reuse_hash();
         let reused_stream = self.reused_stream(peer).await;
-        if let Some(s) = reused_stream {
-            Ok((s, true))
+        let (stream, was_reused) = if let Some(s) = reused_stream {
+            (s, true)
         } else {
             let s = self.new_stream(peer).await?;
-            Ok((s, false))
-        }
+            (s, false)
+        };
+
+        // Track that this connection is now active
+        self.stats_tracker.on_connection_acquired(key, was_reused);
+
+        Ok((stream, was_reused))
     }
 
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.preferred_http_version.add(peer, 1);
+    }
+
+    /// Get all backend connection statistics
+    ///
+    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// and the value is a [BackendStatsView] providing real-time access to the stats.
+    ///
+    /// The returned views give you live access to the atomic counters, so calling
+    /// `.active()` or `.idle()` on them will always return the current value.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let stats = connector.get_backend_stats();
+    /// for (backend_hash, view) in stats {
+    ///     println!("Backend {}: {} active, {} idle",
+    ///              backend_hash, view.active(), view.idle());
+    /// }
+    /// ```
+    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+        self.stats_tracker.get_backend_stats()
+    }
+
+    /// Get stats for a specific backend
+    ///
+    /// Returns None if the backend has never been seen, otherwise returns a
+    /// [BackendStatsView] providing real-time access to the stats.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let peer = BasicPeer::new("127.0.0.1:8080");
+    /// if let Some(view) = connector.get_backend_stat(peer.reuse_hash()) {
+    ///     println!("Active: {}, Idle: {}", view.active(), view.idle());
+    /// }
+    /// ```
+    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
+        self.stats_tracker.get_backend_stat(key)
+    }
+
+    /// Get a reference to the stats tracker for advanced usage
+    pub fn stats(&self) -> &Arc<ConnectionStatsTracker> {
+        &self.stats_tracker
     }
 }
 
