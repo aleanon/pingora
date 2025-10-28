@@ -41,6 +41,7 @@ use futures::future::FutureExt;
 use http::{header, version::Version};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
+use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
@@ -78,6 +79,7 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod statistics;
 pub mod subrequest;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
@@ -100,18 +102,29 @@ pub struct HttpProxy<SV> {
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
+    pub statistics: Statistics,
     max_retries: usize,
 }
 
 impl<SV> HttpProxy<SV> {
-    fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+    fn new(mut inner: SV, conf: Arc<ServerConf>) -> Self
+    where
+        SV: ProxyHttp,
+    {
+        let client_upstream = Connector::new(Some(ConnectorOptions::from_server_conf(&conf)));
+        let statistics = inner.statistics(|backends| {
+            client_upstream.register_backends(backends.clone());
+            Statistics::new(backends)
+        });
+
         HttpProxy {
             inner,
-            client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
+            client_upstream,
             shutdown: Notify::new(),
             server_options: None,
             h2_options: None,
             downstream_modules: HttpModules::new(),
+            statistics,
             max_retries: conf.max_retries,
         }
     }
@@ -533,7 +546,7 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
 impl<SV> HttpProxy<SV> {
     /// Get all backend connection statistics
     ///
-    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// Returns a HashMap where the key is the backend SocketAddr
     /// and the value is a [BackendStatsView] providing real-time access to the stats.
     ///
     /// This allows you to monitor active and idle connections per backend from your
@@ -543,29 +556,13 @@ impl<SV> HttpProxy<SV> {
     /// ```ignore
     /// // In your service struct, store a reference to HttpProxy
     /// let stats = http_proxy.get_backend_stats();
-    /// for (backend_hash, view) in stats {
+    /// for (backend_addr, view) in stats {
     ///     println!("Backend {}: {} active, {} idle",
-    ///              backend_hash, view.active(), view.idle());
+    ///              backend_addr, view.active(), view.idle());
     /// }
     /// ```
-    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+    pub fn get_backend_stats(&self) -> HashMap<SocketAddr, BackendStatsView> {
         self.client_upstream.get_backend_stats()
-    }
-
-    /// Get connection statistics for a specific backend
-    ///
-    /// Returns None if the backend has never been seen, otherwise returns a
-    /// [BackendStatsView] providing real-time access to the stats.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let peer = HttpPeer::new("127.0.0.1:8080", false, "".to_string());
-    /// if let Some(view) = http_proxy.get_backend_stat(peer.reuse_hash()) {
-    ///     println!("Active: {}, Idle: {}", view.active(), view.idle());
-    /// }
-    /// ```
-    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
-        self.client_upstream.get_backend_stat(key)
     }
 }
 
@@ -937,6 +934,8 @@ where
 }
 
 use pingora_core::services::listening::Service;
+
+use crate::statistics::Statistics;
 
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///

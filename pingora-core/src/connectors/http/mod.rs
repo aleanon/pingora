@@ -16,6 +16,7 @@
 
 use crate::connectors::{BackendStatsView, ConnectorOptions};
 use crate::protocols::http::client::HttpSession;
+use crate::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
 use crate::upstreams::peer::Peer;
 use pingora_error::Result;
 use std::collections::HashMap;
@@ -96,21 +97,18 @@ impl Connector {
 
     /// Get all backend connection statistics
     ///
-    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// Returns a HashMap where the key is the backend SocketAddr
     /// and the value is a [BackendStatsView] providing real-time access to the stats.
     ///
     /// Note: This returns stats from the H1 connector. H2 uses a different connection
     /// model and its stats are included in the H1 transport layer.
-    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+    pub fn get_backend_stats(&self) -> HashMap<PingoraSocketAddr, BackendStatsView> {
         self.h1.get_backend_stats()
     }
 
-    /// Get connection statistics for a specific backend
-    ///
-    /// Returns None if the backend has never been seen, otherwise returns a
-    /// [BackendStatsView] providing real-time access to the stats.
-    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
-        self.h1.get_backend_stat(key)
+    /// Pre-register backend addresses to initialize their stats
+    pub fn register_backends(&self, backends: Vec<PingoraSocketAddr>) {
+        self.h1.register_backends(backends);
     }
 }
 

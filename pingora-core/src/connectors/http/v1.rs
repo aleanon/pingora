@@ -14,6 +14,7 @@
 
 use crate::connectors::{BackendStatsView, ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession;
+use crate::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
 use crate::upstreams::peer::Peer;
 
 use pingora_error::Result;
@@ -36,6 +37,14 @@ impl Connector {
         peer: &P,
     ) -> Result<(HttpSession, bool)> {
         let (stream, reused) = self.transport.get_stream(peer).await?;
+
+        // Track session acquisition at HTTP layer (not transport layer)
+        self.transport.stats().on_connection_acquired(
+            peer.reuse_hash(),
+            peer.address().clone(),
+            reused,
+        );
+
         let http = HttpSession::new(stream);
         Ok((http, reused))
     }
@@ -57,26 +66,28 @@ impl Connector {
         idle_timeout: Option<Duration>,
     ) {
         session.respect_keepalive();
+
+        // Track session release at HTTP layer
+        let reuse_hash = peer.reuse_hash();
+        self.transport.stats().on_connection_released(reuse_hash);
+
         if let Some(stream) = session.reuse().await {
             self.transport
-                .release_stream(stream, peer.reuse_hash(), idle_timeout);
+                .release_stream(stream, reuse_hash, idle_timeout);
         }
     }
 
     /// Get all backend connection statistics
     ///
-    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// Returns a HashMap where the key is the backend SocketAddr
     /// and the value is a [BackendStatsView] providing real-time access to the stats.
-    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+    pub fn get_backend_stats(&self) -> HashMap<PingoraSocketAddr, BackendStatsView> {
         self.transport.get_backend_stats()
     }
 
-    /// Get connection statistics for a specific backend
-    ///
-    /// Returns None if the backend has never been seen, otherwise returns a
-    /// [BackendStatsView] providing real-time access to the stats.
-    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
-        self.transport.get_backend_stat(key)
+    /// Pre-register backend addresses to initialize their stats
+    pub fn register_backends(&self, backends: Vec<PingoraSocketAddr>) {
+        self.transport.register_backends(backends);
     }
 }
 

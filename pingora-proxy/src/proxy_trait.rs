@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::statistics::Statistics;
+
 use super::*;
 use pingora_cache::{
     key::HashBinary,
     CacheKey, CacheMeta, ForcedFreshness, HitHandler,
     RespCacheable::{self, *},
 };
+use pingora_core::protocols::l4::socket::SocketAddr;
 use proxy_cache::range_filter::{self};
 use std::time::Duration;
 
@@ -532,6 +535,16 @@ pub trait ProxyHttp {
         _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// This function will be called on startup to pass an immutable statistics view.
+    /// Default impl does nothing.
+    /// Store statistics locally to for an immutable view on up to date statistics.
+    fn statistics(
+        &mut self,
+        register_backends: impl Fn(Vec<SocketAddr>) -> Statistics,
+    ) -> Statistics {
+        register_backends(Vec::new())
     }
 }
 

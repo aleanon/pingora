@@ -16,6 +16,7 @@ use super::HttpSession;
 use crate::connectors::{BackendStatsView, ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
+use crate::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
@@ -274,6 +275,14 @@ impl Connector {
         if conn.more_streams_allowed() {
             self.in_use_pool.insert(peer.reuse_hash(), conn);
         }
+
+        // Track that we acquired a new stream (was_reused = false for new connection)
+        self.transport.stats().on_connection_acquired(
+            peer.reuse_hash(),
+            peer.address().clone(),
+            false,
+        );
+
         Ok(HttpSession::H2(h2_stream))
     }
 
@@ -308,6 +317,16 @@ impl Connector {
             if conn.more_streams_allowed() {
                 self.in_use_pool.insert(reuse_hash, conn);
             }
+
+            // Track that we acquired a reused stream (was_reused = true)
+            if h2_stream.is_some() {
+                self.transport.stats().on_connection_acquired(
+                    reuse_hash,
+                    peer.address().clone(),
+                    true,
+                );
+            }
+
             Ok(h2_stream)
         } else {
             Ok(None)
@@ -338,6 +357,9 @@ impl Connector {
         let locked = conn.0.release_lock.lock_arc();
         // this drop() will both drop the actual stream and call the conn.release_stream()
         drop(session);
+
+        // Track that we released a stream
+        self.transport.stats().on_connection_released(reuse_hash);
         // find and remove the conn stored in in_use_pool so that it could be put in the idle pool
         // if necessary
         let conn = self.in_use_pool.release(reuse_hash, id).unwrap_or(conn);
@@ -381,21 +403,18 @@ impl Connector {
 
     /// Get all backend connection statistics
     ///
-    /// Returns a HashMap where the key is the backend hash (from peer.reuse_hash())
+    /// Returns a HashMap where the key is the backend SocketAddr
     /// and the value is a [BackendStatsView] providing real-time access to the stats.
     ///
     /// Note: This returns stats from the underlying transport layer which is shared
     /// between H1 and H2 connections.
-    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+    pub fn get_backend_stats(&self) -> HashMap<PingoraSocketAddr, BackendStatsView> {
         self.transport.get_backend_stats()
     }
 
-    /// Get connection statistics for a specific backend
-    ///
-    /// Returns None if the backend has never been seen, otherwise returns a
-    /// [BackendStatsView] providing real-time access to the stats.
-    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
-        self.transport.get_backend_stat(key)
+    /// Pre-register backend addresses to initialize their stats
+    pub fn register_backends(&self, backends: Vec<PingoraSocketAddr>) {
+        self.transport.register_backends(backends);
     }
 }
 

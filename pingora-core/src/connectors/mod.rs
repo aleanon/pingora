@@ -25,6 +25,7 @@ mod tls;
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
 
+use crate::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
 use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
@@ -38,7 +39,7 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 pub use stats::{BackendConnectionStats, BackendStatsView, ConnectionStatsTracker};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::SocketAddr as StdSocketAddr;
 use std::sync::Arc;
 use tls::TlsConnector;
 use tokio::sync::Mutex;
@@ -78,9 +79,9 @@ pub struct ConnectorOptions {
     /// Syntax: (#pools, #thread in each pool)
     pub offload_threadpool: Option<(usize, usize)>,
     /// Bind to any of the given source IPv6 addresses
-    pub bind_to_v4: Vec<SocketAddr>,
+    pub bind_to_v4: Vec<StdSocketAddr>,
     /// Bind to any of the given source IPv4 addresses
-    pub bind_to_v6: Vec<SocketAddr>,
+    pub bind_to_v6: Vec<StdSocketAddr>,
 }
 
 impl ConnectorOptions {
@@ -99,7 +100,7 @@ impl ConnectorOptions {
             .iter()
             .map(|v4| {
                 let ip = v4.parse().unwrap();
-                SocketAddr::new(ip, 0)
+                StdSocketAddr::new(ip, 0)
             })
             .collect();
 
@@ -108,7 +109,7 @@ impl ConnectorOptions {
             .iter()
             .map(|v6| {
                 let ip = v6.parse().unwrap();
-                SocketAddr::new(ip, 0)
+                StdSocketAddr::new(ip, 0)
             })
             .collect();
         ConnectorOptions {
@@ -145,8 +146,8 @@ pub struct TransportConnector {
     tls_ctx: tls::Connector,
     connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
     offload: Option<OffloadRuntime>,
-    bind_to_v4: Vec<SocketAddr>,
-    bind_to_v6: Vec<SocketAddr>,
+    bind_to_v4: Vec<StdSocketAddr>,
+    bind_to_v6: Vec<StdSocketAddr>,
     preferred_http_version: PreferredHttpVersion,
     stats_tracker: Arc<ConnectionStatsTracker>,
 }
@@ -266,8 +267,7 @@ impl TransportConnector {
         idle_timeout: Option<std::time::Duration>,
     ) {
         if !test_reusable_stream(&mut stream) {
-            // Connection is not reusable, track it as closed
-            self.stats_tracker.on_connection_closed(key);
+            // Connection is not reusable
             return;
         }
         let id = stream.id();
@@ -276,9 +276,6 @@ impl TransportConnector {
         let stream = Arc::new(Mutex::new(stream));
         let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
         let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
-
-        // Track that this connection is now released to the pool
-        self.stats_tracker.on_connection_released(key);
 
         let pool = self.connection_pool.clone(); //clone the arc
         let rt = pingora_runtime::current_handle();
@@ -298,7 +295,6 @@ impl TransportConnector {
         &self,
         peer: &P,
     ) -> Result<(Stream, bool)> {
-        let key = peer.reuse_hash();
         let reused_stream = self.reused_stream(peer).await;
         let (stream, was_reused) = if let Some(s) = reused_stream {
             (s, true)
@@ -306,9 +302,6 @@ impl TransportConnector {
             let s = self.new_stream(peer).await?;
             (s, false)
         };
-
-        // Track that this connection is now active
-        self.stats_tracker.on_connection_acquired(key, was_reused);
 
         Ok((stream, was_reused))
     }
@@ -334,24 +327,25 @@ impl TransportConnector {
     ///              backend_hash, view.active(), view.idle());
     /// }
     /// ```
-    pub fn get_backend_stats(&self) -> HashMap<u64, BackendStatsView> {
+    pub fn get_backend_stats(&self) -> HashMap<PingoraSocketAddr, BackendStatsView> {
         self.stats_tracker.get_backend_stats()
     }
 
-    /// Get stats for a specific backend
+    /// Pre-register backend addresses to initialize their stats
     ///
-    /// Returns None if the backend has never been seen, otherwise returns a
-    /// [BackendStatsView] providing real-time access to the stats.
+    /// This is useful for pre-populating the stats tracker with known backends
+    /// before any connections are made, ensuring that all backends appear in
+    /// `get_backend_stats()` even if they haven't been connected to yet.
     ///
     /// # Example
     /// ```ignore
-    /// let peer = BasicPeer::new("127.0.0.1:8080");
-    /// if let Some(view) = connector.get_backend_stat(peer.reuse_hash()) {
-    ///     println!("Active: {}, Idle: {}", view.active(), view.idle());
-    /// }
+    /// connector.register_backends(vec![
+    ///     SocketAddr::from_str("127.0.0.1:8080").unwrap(),
+    ///     SocketAddr::from_str("127.0.0.1:8081").unwrap(),
+    /// ]);
     /// ```
-    pub fn get_backend_stat(&self, key: u64) -> Option<BackendStatsView> {
-        self.stats_tracker.get_backend_stat(key)
+    pub fn register_backends(&self, backends: Vec<PingoraSocketAddr>) {
+        self.stats_tracker.register_backends(backends);
     }
 
     /// Get a reference to the stats tracker for advanced usage
