@@ -195,6 +195,10 @@ impl<SV> HttpProxy<SV> {
                             .proxy_to_h1_upstream(session, &mut h1, client_reused, &peer, ctx)
                             .await;
                         if client_reuse {
+                            self.inner
+                                .upstream_stream_ended(session, &peer, client_reused, ctx)
+                                .await;
+
                             let session = ClientSession::H1(h1);
                             self.client_upstream
                                 .release_http_session(session, &*peer, peer.idle_timeout())
@@ -206,6 +210,11 @@ impl<SV> HttpProxy<SV> {
                         let (server_reused, mut error) = self
                             .proxy_to_h2_upstream(session, &mut h2, client_reused, &peer, ctx)
                             .await;
+
+                        self.inner
+                            .upstream_stream_ended(session, &peer, client_reused, ctx)
+                            .await;
+
                         let session = ClientSession::H2(h2);
                         self.client_upstream
                             .release_http_session(session, &*peer, peer.idle_timeout())

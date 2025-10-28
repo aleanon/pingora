@@ -503,6 +503,31 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// This filter is called when an HTTP stream/session to the upstream has ended
+    ///
+    /// This is called right before the connection is released back to the connection pool
+    /// (for both HTTP/1 and HTTP/2). For HTTP/2, this is called once per stream, not per
+    /// underlying connection.
+    ///
+    /// This allows tracking of concurrent request/stream counts per backend, latency
+    /// measurements, or other per-request metrics.
+    ///
+    /// # Arguments
+    /// * `session` - The downstream session
+    /// * `peer` - The upstream peer that was connected to
+    /// * `reused` - Whether the connection/stream was reused from the pool
+    /// * `ctx` - The request context
+    async fn upstream_stream_ended(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        _reused: bool,
+        _ctx: &mut Self::CTX,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+    }
+
     /// This callback is invoked every time request related error log needs to be generated
     ///
     /// Users can define what is important to be written about this request via the returned string.
