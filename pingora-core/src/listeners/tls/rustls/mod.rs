@@ -36,6 +36,8 @@ pub struct TlsSettings {
     key_path: String,
     cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    /// A config built by the caller, used instead of the paths, resolver and verifier.
+    server_config: Option<Arc<ServerConfig>>,
     callbacks: Option<TlsAcceptCallbacks>,
     offload_threadpool: Option<(usize, usize)>,
 }
@@ -58,15 +60,45 @@ impl TlsSettings {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
 
+        let mut config = if let Some(config) = self.server_config {
+            // Fail closed rather than silently drop e.g. a client certificate verifier
+            assert!(
+                self.client_cert_verifier.is_none()
+                    && self.cert_resolver.is_none()
+                    && self.cert_path.is_empty()
+                    && self.key_path.is_empty(),
+                "A TlsSettings made with with_server_config() takes its certificates and client \
+                 verification from that config; set_cert_resolver(), set_client_cert_verifier() \
+                 and the certificate files can't be combined with it."
+            );
+            Arc::unwrap_or_clone(config)
+        } else {
+            self.build_server_config()
+        };
+
+        if let Some(alpn_protocols) = self.alpn_protocols {
+            config.alpn_protocols = alpn_protocols;
+        }
+
+        Acceptor {
+            acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            callbacks: self.callbacks.map(SharedTlsAcceptCallbacks::from),
+            offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
+                OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
+            }),
+        }
+    }
+
+    fn build_server_config(&self) -> ServerConfig {
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
-        let builder = if let Some(verifier) = self.client_cert_verifier {
+        let builder = if let Some(verifier) = self.client_cert_verifier.clone() {
             builder.with_client_cert_verifier(verifier)
         } else {
             builder.with_no_client_auth()
         };
 
-        let mut config = if let Some(resolver) = self.cert_resolver {
+        if let Some(resolver) = self.cert_resolver.clone() {
             builder.with_cert_resolver(resolver)
         } else {
             assert!(
@@ -89,18 +121,6 @@ impl TlsSettings {
                     format!("Failed to create server listener config: {e}")
                 })
                 .unwrap()
-        };
-
-        if let Some(alpn_protocols) = self.alpn_protocols {
-            config.alpn_protocols = alpn_protocols;
-        }
-
-        Acceptor {
-            acceptor: RusTlsAcceptor::from(Arc::new(config)),
-            callbacks: self.callbacks.map(SharedTlsAcceptCallbacks::from),
-            offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
-                OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
-            }),
         }
     }
 
@@ -198,9 +218,29 @@ impl TlsSettings {
             key_path: key_path.to_string(),
             cert_resolver: None,
             client_cert_verifier: None,
+            server_config: None,
             callbacks: None,
             offload_threadpool: None,
         })
+    }
+
+    /// Accept connections with a server config built by the caller, e.g. to restrict the
+    /// protocol versions, which the other constructors fix at TLS 1.2 and 1.3. The config
+    /// carries its own certificates and client verification: [Self::build] panics if certificate
+    /// files, [Self::set_cert_resolver] or [Self::set_client_cert_verifier] are set as well. The
+    /// config's ALPN protocols are kept unless [Self::enable_h2] or [Self::set_alpn] is called;
+    /// handshake offload can still be set.
+    pub fn with_server_config(config: Arc<ServerConfig>) -> Self {
+        TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            cert_resolver: None,
+            client_cert_verifier: None,
+            server_config: Some(config),
+            callbacks: None,
+            offload_threadpool: None,
+        }
     }
 
     /// Create a new [`TlsSettings`] with post-handshake callbacks.
@@ -218,6 +258,7 @@ impl TlsSettings {
             key_path: String::new(),
             cert_resolver: None,
             client_cert_verifier: None,
+            server_config: None,
             callbacks: Some(callbacks),
             offload_threadpool: None,
         })
@@ -292,6 +333,63 @@ mod tests {
     use crate::protocols::l4::stream::Stream as L4Stream;
     use pingora_rustls::load_certs_and_key_files;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn caller_built_config_is_used_with_its_alpn_unless_h2_is_enabled() {
+        pingora_rustls::install_default_crypto_provider();
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let (certs, key) = load_certs_and_key_files(
+            &format!("{dir}/tests/keys/server.crt"),
+            &format!("{dir}/tests/keys/key.pem"),
+        )
+        .unwrap()
+        .unwrap();
+        let mut config = ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"custom".to_vec()];
+        let config = Arc::new(config);
+
+        let acceptor = TlsSettings::with_server_config(config.clone()).build();
+        assert_eq!(
+            acceptor.acceptor.config().alpn_protocols,
+            vec![b"custom".to_vec()]
+        );
+
+        let mut settings = TlsSettings::with_server_config(config);
+        settings.enable_h2();
+        let acceptor = settings.build();
+        assert_eq!(
+            acceptor.acceptor.config().alpn_protocols,
+            ALPN::H2H1.to_wire_protocols()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "can't be combined")]
+    fn a_verifier_is_not_silently_dropped_from_a_caller_built_config() {
+        pingora_rustls::install_default_crypto_provider();
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let (certs, key) = load_certs_and_key_files(
+            &format!("{dir}/tests/keys/server.crt"),
+            &format!("{dir}/tests/keys/key.pem"),
+        )
+        .unwrap()
+        .unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+            .unwrap();
+        let mut roots = pingora_rustls::RootCertStore::empty();
+        roots.add(certs[0].clone()).unwrap();
+        let verifier = pingora_rustls::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut settings = TlsSettings::with_server_config(Arc::new(config));
+        settings.set_client_cert_verifier(verifier);
+        settings.build();
+    }
 
     #[tokio::test]
     async fn test_from_server_config_handshake() {
